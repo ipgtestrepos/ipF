@@ -1,6 +1,6 @@
 /*
 
-Copyright (c) 2019 Alex Forencich
+Copyright (c) 2017 Alex Forencich
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -27,64 +27,54 @@ THE SOFTWARE.
 `timescale 1ns / 1ps
 
 /*
- * I2C slave AXI lite master wrapper
+ * I2C slave wishbone master wrapper
  */
-module i2c_slave_axil_master #
+module i2c_slave_wbm #
 (
     parameter FILTER_LEN = 4,
-    parameter DATA_WIDTH = 32,  // width of data bus in bits
-    parameter ADDR_WIDTH = 16,  // width of address bus in bits
-    parameter STRB_WIDTH = (DATA_WIDTH/8)
+    parameter WB_DATA_WIDTH = 32,                  // width of data bus in bits (8, 16, 32, or 64)
+    parameter WB_ADDR_WIDTH = 32,                  // width of address bus in bits
+    parameter WB_SELECT_WIDTH = (WB_DATA_WIDTH/8)  // width of word select bus (1, 2, 4, or 8)
 )
 (
-    input wire                    clk,
-    input wire                    rst,
+    input wire                        clk,
+    input wire                        rst,
 
     /*
      * I2C interface
      */
-    input  wire                   i2c_scl_i,
-    output wire                   i2c_scl_o,
-    output wire                   i2c_scl_t,
-    input  wire                   i2c_sda_i,
-    output wire                   i2c_sda_o,
-    output wire                   i2c_sda_t,
+    input  wire                       i2c_scl_i,
+    output wire                       i2c_scl_o,
+    output wire                       i2c_scl_t,
+    input  wire                       i2c_sda_i,
+    output wire                       i2c_sda_o,
+    output wire                       i2c_sda_t,
 
     /*
-     * AXI lite master interface
+     * Wishbone interface
      */
-    output wire [ADDR_WIDTH-1:0]  m_axil_awaddr,
-    output wire [2:0]             m_axil_awprot,
-    output wire                   m_axil_awvalid,
-    input  wire                   m_axil_awready,
-    output wire [DATA_WIDTH-1:0]  m_axil_wdata,
-    output wire [STRB_WIDTH-1:0]  m_axil_wstrb,
-    output wire                   m_axil_wvalid,
-    input  wire                   m_axil_wready,
-    input  wire [1:0]             m_axil_bresp,
-    input  wire                   m_axil_bvalid,
-    output wire                   m_axil_bready,
-    output wire [ADDR_WIDTH-1:0]  m_axil_araddr,
-    output wire [2:0]             m_axil_arprot,
-    output wire                   m_axil_arvalid,
-    input  wire                   m_axil_arready,
-    input  wire [DATA_WIDTH-1:0]  m_axil_rdata,
-    input  wire [1:0]             m_axil_rresp,
-    input  wire                   m_axil_rvalid,
-    output wire                   m_axil_rready,
+    output wire [WB_ADDR_WIDTH-1:0]   wb_adr_o,   // ADR_O() address
+    input  wire [WB_DATA_WIDTH-1:0]   wb_dat_i,   // DAT_I() data in
+    output wire [WB_DATA_WIDTH-1:0]   wb_dat_o,   // DAT_O() data out
+    output wire                       wb_we_o,    // WE_O write enable output
+    output wire [WB_SELECT_WIDTH-1:0] wb_sel_o,   // SEL_O() select output
+    output wire                       wb_stb_o,   // STB_O strobe output
+    input  wire                       wb_ack_i,   // ACK_I acknowledge input
+    input  wire                       wb_err_i,   // ERR_I error input
+    output wire                       wb_cyc_o,   // CYC_O cycle output
 
     /*
      * Status
      */
-    output wire                   busy,
-    output wire                   bus_addressed,
-    output wire                   bus_active,
+    output wire                       busy,
+    output wire                       bus_addressed,
+    output wire                       bus_active,
 
     /*
      * Configuration
      */
-    input  wire                   enable,
-    input  wire [6:0]             device_address
+    input  wire                       enable,
+    input  wire [6:0]                 device_address
 );
 /*
 
@@ -104,15 +94,15 @@ scl  ST \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ 
 
 Operation:
 
-This module enables I2C control over an AXI lite bus, useful for enabling a
+This module enables I2C control over a Wishbone bus, useful for enabling a
 design to operate as a peripheral to an external microcontroller or similar.
-The AXI lite interface are fully parametrizable, with the restriction that the
+The Wishbone interface are fully parametrizable, with the restriction that the
 bus must be divided into 2**m words of 8*2**n bits.
 
 Writing via I2C first accesses an internal address register, followed by the
-actual AXI lite bus.  The first k bytes go to the address register, where
+actual wishbone bus.  The first k bytes go to the address register, where
 
-    k = ceil(log2(ADDR_WIDTH+log2(DATA_WIDTH/SELECT_WIDTH))/8)
+    k = ceil(log2(WB_ADDR_WIDTH+log2(WB_DATA_WIDTH/WB_SELECT_WIDTH))/8)
 
 .  The address pointer will automatically increment with reads and writes.
 For buses with word size > 8 bits, the address register is in bytes and
@@ -121,9 +111,9 @@ the same I2C transaction are coalesced and written either once a complete
 word is ready or when the I2C transaction terminates with a stop or repeated
 start.
 
-Reading via the I2C interface immediately starts reading from the AXI lite
+Reading via the I2C interface immediately starts reading from the Wishbone
 interface starting from the current value of the internal address register.
-Like writes, reads are also coalesced when possible.  One AXI lite read is
+Like writes, reads are also coalesced when possible.  One wishbone read is
 performed on the first I2C read.  Once that has been completey transferred
 out, another read will be performed on the start of the next I2C read
 operation.
@@ -196,32 +186,32 @@ I/O pin.  This would prevent devices from stretching the clock period.
 */
 
 // for interfaces that are more than one word wide, disable address lines
-parameter VALID_ADDR_WIDTH = ADDR_WIDTH - $clog2(STRB_WIDTH);
-// width of data port in words
-parameter WORD_WIDTH = STRB_WIDTH;
-// size of words
-parameter WORD_SIZE = DATA_WIDTH/WORD_WIDTH;
+parameter WB_VALID_ADDR_WIDTH = WB_ADDR_WIDTH - $clog2(WB_SELECT_WIDTH);
+// width of data port in words (1, 2, 4, or 8)
+parameter WB_WORD_WIDTH = WB_SELECT_WIDTH;
+// size of words (8, 16, 32, or 64 bits)
+parameter WB_WORD_SIZE = WB_DATA_WIDTH/WB_WORD_WIDTH;
 
-parameter WORD_PART_ADDR_WIDTH = $clog2(WORD_SIZE/8);
+parameter WORD_PART_ADDR_WIDTH = $clog2(WB_WORD_SIZE/8);
 
-parameter ADDR_WIDTH_ADJ = ADDR_WIDTH+WORD_PART_ADDR_WIDTH;
+parameter ADDR_WIDTH_ADJ = WB_ADDR_WIDTH+WORD_PART_ADDR_WIDTH;
 
 parameter ADDR_WORD_WIDTH = (ADDR_WIDTH_ADJ+7)/8;
 
 // bus width assertions
 initial begin
-    if (WORD_WIDTH * WORD_SIZE != DATA_WIDTH) begin
-        $error("Error: AXI data width not evenly divisble");
+    if (WB_WORD_WIDTH * WB_WORD_SIZE != WB_DATA_WIDTH) begin
+        $error("Error: WB data width not evenly divisble");
         $finish;
     end
 
-    if (2**$clog2(WORD_WIDTH) != WORD_WIDTH) begin
-        $error("Error: AXI word width must be even power of two");
+    if (2**$clog2(WB_WORD_WIDTH) != WB_WORD_WIDTH) begin
+        $error("Error: WB word width must be even power of two");
         $finish;
     end
 
-    if (8*2**$clog2(WORD_SIZE/8) != WORD_SIZE) begin
-        $error("Error: AXI word size must be a power of two multiple of 8 bits");
+    if (8*2**$clog2(WB_WORD_SIZE/8) != WB_WORD_SIZE) begin
+        $error("Error: WB word size must be a power of two multiple of 8 bits");
         $finish;
     end
 end
@@ -240,14 +230,12 @@ reg [7:0] count_reg = 8'd0, count_next;
 reg last_cycle_reg = 1'b0;
 
 reg [ADDR_WIDTH_ADJ-1:0] addr_reg = {ADDR_WIDTH_ADJ{1'b0}}, addr_next;
-reg [DATA_WIDTH-1:0] data_reg = {DATA_WIDTH{1'b0}}, data_next;
+reg [WB_DATA_WIDTH-1:0] data_reg = {WB_DATA_WIDTH{1'b0}}, data_next;
 
-reg m_axil_awvalid_reg = 1'b0, m_axil_awvalid_next;
-reg [STRB_WIDTH-1:0] m_axil_wstrb_reg = {STRB_WIDTH{1'b0}}, m_axil_wstrb_next;
-reg m_axil_wvalid_reg = 1'b0, m_axil_wvalid_next;
-reg m_axil_bready_reg = 1'b0, m_axil_bready_next;
-reg m_axil_arvalid_reg = 1'b0, m_axil_arvalid_next;
-reg m_axil_rready_reg = 1'b0, m_axil_rready_next;
+reg wb_we_o_reg = 1'b0, wb_we_o_next;
+reg [WB_SELECT_WIDTH-1:0] wb_sel_o_reg = {WB_SELECT_WIDTH{1'b0}}, wb_sel_o_next;
+reg wb_stb_o_reg = 1'b0, wb_stb_o_next;
+reg wb_cyc_o_reg = 1'b0, wb_cyc_o_next;
 
 reg busy_reg = 1'b0;
 
@@ -260,17 +248,12 @@ wire data_out_valid;
 wire data_out_last;
 reg data_out_ready_reg = 1'b0, data_out_ready_next;
 
-assign m_axil_awaddr = {addr_reg[ADDR_WIDTH_ADJ-1:ADDR_WIDTH_ADJ-VALID_ADDR_WIDTH], {ADDR_WIDTH-VALID_ADDR_WIDTH{1'b0}}};
-assign m_axil_awprot = 3'b010;
-assign m_axil_awvalid = m_axil_awvalid_reg;
-assign m_axil_wdata = data_reg;
-assign m_axil_wstrb = m_axil_wstrb_reg;
-assign m_axil_wvalid = m_axil_wvalid_reg;
-assign m_axil_bready = m_axil_bready_reg;
-assign m_axil_araddr = {addr_reg[ADDR_WIDTH_ADJ-1:ADDR_WIDTH_ADJ-VALID_ADDR_WIDTH], {ADDR_WIDTH-VALID_ADDR_WIDTH{1'b0}}};
-assign m_axil_arprot = 3'b010;
-assign m_axil_arvalid = m_axil_arvalid_reg;
-assign m_axil_rready = m_axil_rready_reg;
+assign wb_adr_o = {addr_reg[ADDR_WIDTH_ADJ-1:ADDR_WIDTH_ADJ-WB_VALID_ADDR_WIDTH], {WB_ADDR_WIDTH-WB_VALID_ADDR_WIDTH{1'b0}}};
+assign wb_dat_o = data_reg;
+assign wb_we_o = wb_we_o_reg;
+assign wb_sel_o = wb_sel_o_reg;
+assign wb_stb_o = wb_stb_o_reg;
+assign wb_cyc_o = wb_cyc_o_reg;
 
 assign busy = busy_reg;
 
@@ -287,74 +270,24 @@ always @* begin
     addr_next = addr_reg;
     data_next = data_reg;
 
-    m_axil_awvalid_next = m_axil_awvalid_reg && !m_axil_awready;
-    m_axil_wstrb_next = m_axil_wstrb_reg;
-    m_axil_wvalid_next = m_axil_wvalid_reg && !m_axil_wready;
-    m_axil_bready_next = 1'b0;
-    m_axil_arvalid_next = m_axil_arvalid_reg && !m_axil_arready;
-    m_axil_rready_next = 1'b0;
+    wb_we_o_next = wb_we_o_reg;
+    wb_sel_o_next = wb_sel_o_reg;
+    wb_stb_o_next = 1'b0;
+    wb_cyc_o_next = 1'b0;
 
     case (state_reg)
-        STATE_IDLE: begin
-            // idle, wait for I2C interface
-
-            if (data_out_valid) begin
-                // store address and write
-                count_next = ADDR_WORD_WIDTH-1;
-                state_next = STATE_ADDRESS;
-            end else if (data_in_ready && !data_in_valid_reg) begin
-                // read
-                m_axil_arvalid_next = 1'b1;
-                m_axil_rready_next = 1'b1;
-                state_next = STATE_READ_1;
-            end
-        end
-        STATE_ADDRESS: begin
-            // store address
-            data_out_ready_next = 1'b1;
-
-            if (data_out_ready_reg && data_out_valid) begin
-                // store pointers
-                addr_next[8*count_reg +: 8] = data_out;
-                count_next = count_reg - 1;
-                if (count_reg == 0) begin
-                    // end of header
-                    // set initial word offset
-                    if (ADDR_WIDTH == VALID_ADDR_WIDTH && WORD_PART_ADDR_WIDTH == 0) begin
-                        count_next = 0;
-                    end else begin
-                        count_next = addr_next[ADDR_WIDTH_ADJ-VALID_ADDR_WIDTH-1:0];
-                    end
-                    m_axil_wstrb_next = {STRB_WIDTH{1'b0}};
-                    data_next = {DATA_WIDTH{1'b0}};
-                    if (data_out_last) begin
-                        // end of transaction
-                        state_next = STATE_IDLE;
-                    end else begin
-                        // start writing
-                        state_next = STATE_WRITE_1;
-                    end
-                end else begin
-                    if (data_out_last) begin
-                        // end of transaction
-                        state_next = STATE_IDLE;
-                    end else begin
-                        state_next = STATE_ADDRESS;
-                    end
-                end
-            end else begin
-                state_next = STATE_ADDRESS;
-            end
-        end
         STATE_READ_1: begin
-            // wait for data
-            m_axil_rready_next = 1'b1;
+            // wait for ack
+            wb_cyc_o_next = 1'b1;
+            wb_stb_o_next = 1'b1;
 
-            if (m_axil_rready && m_axil_rvalid) begin
+            if (wb_ack_i || wb_err_i) begin
                 // read cycle complete, store result
-                m_axil_rready_next = 1'b0;
-                data_next = m_axil_rdata;
-                addr_next = addr_reg + (1 << (ADDR_WIDTH-VALID_ADDR_WIDTH+WORD_PART_ADDR_WIDTH));
+                data_next = wb_dat_i;
+                addr_next = addr_reg + (1 << (WB_ADDR_WIDTH-WB_VALID_ADDR_WIDTH+WORD_PART_ADDR_WIDTH));
+                wb_cyc_o_next = 1'b0;
+                wb_stb_o_next = 1'b0;
+                wb_sel_o_next = {WB_SELECT_WIDTH{1'b0}};
                 state_next = STATE_READ_2;
             end else begin
                 state_next = STATE_READ_1;
@@ -362,15 +295,15 @@ always @* begin
         end
         STATE_READ_2: begin
             // send data
-            if (data_out_valid || !bus_addressed) begin
+            if (data_out_valid | !bus_addressed) begin
                 // no longer addressed or now addressed for write, return to idle
                 state_next = STATE_IDLE;
-            end else if (data_in_ready && !data_in_valid_reg) begin
+            end else if (data_in_ready & ~data_in_valid_reg) begin
                 // transfer word and update pointers
                 data_in_next = data_reg[8*count_reg +: 8];
                 data_in_valid_next = 1'b1;
                 count_next = count_reg + 1;
-                if (count_reg == (STRB_WIDTH*WORD_SIZE/8)-1) begin
+                if (count_reg == (WB_SELECT_WIDTH*WB_WORD_SIZE/8)-1) begin
                     // end of stored data word; return to idle
                     count_next = 0;
                     state_next = STATE_IDLE;
@@ -385,17 +318,17 @@ always @* begin
             // write data
             data_out_ready_next = 1'b1;
 
-            if (data_out_ready_reg && data_out_valid) begin
+            if (data_out_ready_reg & data_out_valid) begin
                 // store word
                 data_next[8*count_reg +: 8] = data_out;
                 count_next = count_reg + 1;
-                m_axil_wstrb_next[count_reg >> ((WORD_SIZE/8)-1)] = 1'b1;
-                if (count_reg == (STRB_WIDTH*WORD_SIZE/8)-1 || data_out_last) begin
+                wb_sel_o_next[count_reg >> ((WB_WORD_SIZE/8)-1)] = 1'b1;
+                if (count_reg == (WB_SELECT_WIDTH*WB_WORD_SIZE/8)-1 || data_out_last) begin
                     // have full word or at end of block, start write operation
                     count_next = 0;
-                    m_axil_awvalid_next = 1'b1;
-                    m_axil_wvalid_next = 1'b1;
-                    m_axil_bready_next = 1'b1;
+                    wb_we_o_next = 1'b1;
+                    wb_cyc_o_next = 1'b1;
+                    wb_stb_o_next = 1'b1;
                     state_next = STATE_WRITE_2;
                 end else begin
                     state_next = STATE_WRITE_1;
@@ -405,15 +338,17 @@ always @* begin
             end
         end
         STATE_WRITE_2: begin
-            // wait for write completion
-            m_axil_bready_next = 1'b1;
+            // wait for ack
+            wb_cyc_o_next = 1'b1;
+            wb_stb_o_next = 1'b1;
 
-            if (m_axil_bready && m_axil_bvalid) begin
+            if (wb_ack_i || wb_err_i) begin
                 // end of write operation
-                data_next = {DATA_WIDTH{1'b0}};
-                addr_next = addr_reg + (1 << (ADDR_WIDTH-VALID_ADDR_WIDTH+WORD_PART_ADDR_WIDTH));
-                m_axil_bready_next = 1'b0;
-                m_axil_wstrb_next = {STRB_WIDTH{1'b0}};
+                data_next = {WB_DATA_WIDTH{1'b0}};
+                addr_next = addr_reg + (1 << (WB_ADDR_WIDTH-WB_VALID_ADDR_WIDTH+WORD_PART_ADDR_WIDTH));
+                wb_cyc_o_next = 1'b0;
+                wb_stb_o_next = 1'b0;
+                wb_sel_o_next = {WB_SELECT_WIDTH{1'b0}};
                 if (last_cycle_reg) begin
                     // end of transaction
                     state_next = STATE_IDLE;
@@ -439,12 +374,10 @@ always @(posedge clk) begin
     addr_reg <= addr_next;
     data_reg <= data_next;
 
-    m_axil_awvalid_reg <= m_axil_awvalid_next;
-    m_axil_wstrb_reg <= m_axil_wstrb_next;
-    m_axil_wvalid_reg <= m_axil_wvalid_next;
-    m_axil_bready_reg <= m_axil_bready_next;
-    m_axil_arvalid_reg <= m_axil_arvalid_next;
-    m_axil_rready_reg <= m_axil_rready_next;
+    wb_we_o_reg <= wb_we_o_next;
+    wb_sel_o_reg <= wb_sel_o_next;
+    wb_stb_o_reg <= wb_stb_o_next;
+    wb_cyc_o_reg <= wb_cyc_o_next;
 
     busy_reg <= state_next != STATE_IDLE;
 
@@ -457,11 +390,8 @@ always @(posedge clk) begin
         state_reg <= STATE_IDLE;
         data_in_valid_reg <= 1'b0;
         data_out_ready_reg <= 1'b0;
-        m_axil_awvalid_reg <= 1'b0;
-        m_axil_wvalid_reg <= 1'b0;
-        m_axil_bready_reg <= 1'b0;
-        m_axil_arvalid_reg <= 1'b0;
-        m_axil_rready_reg <= 1'b0;
+        wb_stb_o_reg <= 1'b0;
+        wb_cyc_o_reg <= 1'b0;
         busy_reg <= 1'b0;
     end
 end
@@ -480,11 +410,6 @@ i2c_slave_inst (
     .s_axis_data_tvalid(data_in_valid_reg),
     .s_axis_data_tready(data_in_ready),
     .s_axis_data_tlast(1'b0),
-
-    .m_axis_data_tdata(data_out),
-    .m_axis_data_tvalid(data_out_valid),
-    .m_axis_data_tready(data_out_ready_reg),
-    .m_axis_data_tlast(data_out_last),
 
     // I2C Interface
     .scl_i(i2c_scl_i),
